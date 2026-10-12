@@ -91,6 +91,93 @@ class GardeFou(unittest.TestCase):
         self.assertEqual(se.check_suppression(self.src, self.dst), (False, 0, 20))
 
 
+class Robocopy(unittest.TestCase):
+    """Le vrai robocopy de Windows, entre deux dossiers temporaires."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.src, self.dst = Path(self._tmp.name) / "src", Path(self._tmp.name) / "dst"
+        self.src.mkdir()
+        self.dst.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(se._stop.clear)
+
+    def test_copie_puis_miroir(self):
+        remplir(self.src, ["a/1.jpg", "a/2.jpg", "b/3.jpg"])
+        code = se.run_robocopy(self.src, self.dst, True)[0]
+        self.assertLessEqual(code, se.ROBOCOPY_OK_MAX)
+        self.assertEqual(se.list_files(self.dst), se.list_files(self.src))
+
+        (self.src / "a" / "2.jpg").unlink()
+        se.run_robocopy(self.src, self.dst, False)  # sans miroir : rien n'est retiré du disque
+        self.assertEqual(len(se.list_files(self.dst)), 3)
+        se.run_robocopy(self.src, self.dst, True)   # miroir : le disque suit la source
+        self.assertEqual(se.list_files(self.dst), se.list_files(self.src))
+        self.assertEqual(se._robocopy, [])
+
+    def test_stop_tombe_au_depart(self):
+        remplir(self.src, [f"{i}.jpg" for i in range(50)])
+        se.stop_robocopy()  # rien ne tourne : sans effet, mais Stop reste levé
+        se.run_robocopy(self.src, self.dst, True)  # arrêté dès son départ, rend la main
+        self.assertEqual(se._robocopy, [])
+        self.assertTrue(se._stop.is_set())
+
+
+class SuivreKadra(unittest.TestCase):
+    EVENTS = ["2026-10-18SAUMUR", "2026-10-12LEMANS"]
+
+    def test_kadra_change_d_event_on_suit(self):
+        self.assertEqual(se.event_to_follow("2026-10-18SAUMUR", "2026-10-12LEMANS", self.EVENTS),
+                         "2026-10-18SAUMUR")
+
+    def test_un_event_choisi_a_la_main_reste_tant_que_kadra_ne_bouge_pas(self):
+        # Kadra dit LEMANS, déjà pris en compte : quel que soit l'event affiché, on n'y touche pas
+        self.assertIsNone(se.event_to_follow("2026-10-12LEMANS", "2026-10-12LEMANS", self.EVENTS))
+
+    def test_un_event_sans_dossier_attend(self):
+        self.assertIsNone(se.event_to_follow("2026-10-25LAMOTTE", "2026-10-12LEMANS", self.EVENTS))
+
+    def test_sans_indice_de_kadra_rien_ne_bouge(self):
+        self.assertIsNone(se.event_to_follow(None, "2026-10-12LEMANS", self.EVENTS))
+        self.assertIsNone(se.event_to_follow("", None, self.EVENTS))
+
+    def test_au_lancement_l_indice_n_a_pas_encore_ete_suivi(self):
+        self.assertEqual(se.event_to_follow("2026-10-18SAUMUR", None, self.EVENTS),
+                         "2026-10-18SAUMUR")
+
+
+class DemarrageDeWindows(unittest.TestCase):
+    """Sur une clé du registre faite pour l'essai : la vraie clé Run n'est jamais touchée."""
+    CLE = r"Software\PrismaSafe-tests\Run"
+
+    def setUp(self):
+        import winreg
+        self.addCleanup(self._menage, winreg)
+
+    def _menage(self, winreg):
+        for cle in (self.CLE, r"Software\PrismaSafe-tests"):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, cle)
+            except OSError:
+                pass
+
+    def test_inscrire_puis_retirer(self):
+        import winreg
+        self.assertFalse(se.startup_enabled(self.CLE))
+        se.set_startup(False, self.CLE)  # retirer ce qui n'y est pas ne casse rien
+        se.set_startup(True, self.CLE, exe=r"C:\Outils\Prisma Safe.exe")
+        self.assertTrue(se.startup_enabled(self.CLE))
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.CLE) as k:
+            commande = winreg.QueryValueEx(k, se.RUN_NAME)[0]
+        self.assertEqual(commande, r'"C:\Outils\Prisma Safe.exe" --au-demarrage')
+        se.set_startup(False, self.CLE)
+        self.assertFalse(se.startup_enabled(self.CLE))
+
+    def test_un_script_ne_s_inscrit_pas_tout_seul(self):
+        se.refresh_startup(self.CLE)  # pas un exe : rien n'est écrit
+        self.assertFalse(se.startup_enabled(self.CLE))
+
+
 def fiche(tag, actifs):
     return {"tag_name": tag, "assets": actifs}
 

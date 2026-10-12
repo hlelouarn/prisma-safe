@@ -38,8 +38,8 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from types import SimpleNamespace
 
-# Version publiée : le tag Git doit porter le même numéro (v1.1.0), le build le vérifie.
-VERSION = "1.1.0"
+# Version publiée : le tag Git doit porter le même numéro (« v » devant), le build le vérifie.
+VERSION = "1.2.0"
 
 APP_NAME = "Prisma Safe"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "PrismaSafe"
@@ -180,13 +180,89 @@ def run_robocopy(src, dst, miroir):
     if miroir:
         args.append("/PURGE")  # supprime côté destination ce qui n'existe plus à la source
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    p = subprocess.run(args, capture_output=True, text=True,
-                       encoding="cp850", errors="replace", creationflags=flags)
-    copied = sum(1 for line in p.stdout.splitlines()
+    # Popen plutôt que run, pour que Stop puisse l'arrêter ; la commande, elle, n'a pas changé.
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="cp850", errors="replace", creationflags=flags)
+    _robocopy.append(p)
+    try:
+        if _stop.is_set():  # Stop est tombé pile pendant le démarrage
+            p.kill()
+        stdout = p.communicate()[0]
+    finally:
+        _robocopy.remove(p)
+    copied = sum(1 for line in stdout.splitlines()
                  if line.strip().lower().startswith(("nouveau fichier", "new file",
                                                      "plus récent", "newer",
                                                      "modifié", "changed")))
-    return p.returncode, copied, p.stdout
+    return p.returncode, copied, stdout
+
+
+_robocopy = []             # le robocopy en cours
+_stop = threading.Event()  # levé par Stop, baissé au départ de chaque copie
+
+
+def stop_robocopy():
+    """Stop : arrête net le robocopy en cours, s'il y en a un. Le fichier qu'il copiait reste
+    incomplet sur le disque ; la copie suivante le reprend (taille et date ne correspondent pas).
+    Un robocopy arrêté rend un code qui ressemble à un succès : c'est `_stop` qui fait foi."""
+    _stop.set()
+    for p in list(_robocopy):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def event_to_follow(hint, followed, events):
+    """L'event sur lequel Kadra vient de passer, s'il faut y passer aussi ; None sinon.
+
+    `hint` est ce que dit son fichier current_event, `followed` le dernier indice déjà pris
+    en compte : un event choisi à la main reste donc en place tant que Kadra n'en change pas.
+    Un event qui n'a pas encore de dossier n'est pas suivi (rien à copier) : on y reviendra.
+    """
+    return hint if hint and hint != followed and hint in events else None
+
+
+# ---------------------------------------------------- démarrage de Windows ----
+# La clé Run de l'utilisateur : pas de droits d'administrateur, rien à nettoyer ailleurs.
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "PrismaSafe"
+ARG_AT_STARTUP = "--au-demarrage"  # lancé par Windows : la fenêtre reste près de l'horloge
+
+
+def startup_enabled(key=RUN_KEY):
+    """Vrai si Windows lance l'outil à l'ouverture de la session."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            winreg.QueryValueEx(k, RUN_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def set_startup(on, key=RUN_KEY, exe=None):
+    """Inscrit l'outil au démarrage de Windows, ou l'en retire."""
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
+        if on:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ,
+                              f'"{exe or sys.executable}" {ARG_AT_STARTUP}')
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def refresh_startup(key=RUN_KEY):
+    """L'exe a pu être déplacé ou renommé : l'inscription suit son emplacement."""
+    try:
+        if getattr(sys, "frozen", False) and startup_enabled(key):
+            set_startup(True, key)
+    except OSError:
+        pass
 
 
 # ----------------------------------------------------------- mise à jour ----
@@ -275,6 +351,8 @@ def verify_download(path, size=None, sha256=None):
 
 def download_update(update):
     """Télécharge le nouvel exe à côté de l'actuel et le vérifie. Rend son chemin."""
+    if not getattr(sys, "frozen", False):  # lancé comme script : l'« exe » serait Python lui-même
+        raise RuntimeError("la mise à jour ne s'installe que sur l'exe")
     exe = Path(sys.executable)
     new = exe.with_name(exe.name + ".new")
     try:
@@ -342,7 +420,7 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 16
 NIIF_INFO, NIIF_WARNING = 1, 2
 MF_STRING, MF_SEPARATOR, TPM_RIGHTBUTTON = 0x0000, 0x0800, 0x0002
-MENU = {1: "open", 2: "backup", 3: "quit"}
+MENU = {1: "open", 2: "backup", 3: "quit", 4: "stop"}
 ERROR_ALREADY_EXISTS = 183
 
 _mutex = []  # le verrou d'instance, gardé jusqu'à la fin du processus
@@ -547,6 +625,7 @@ class Tray(threading.Thread):
         menu = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, MF_STRING, 1, f"Ouvrir {APP_NAME}")
         user32.AppendMenuW(menu, MF_STRING, 2, "Sauvegarder maintenant")
+        user32.AppendMenuW(menu, MF_STRING, 4, "Stop : arrêter les copies")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, 3, "Quitter")
         user32.SetMenuDefaultItem(menu, 1, False)
@@ -690,15 +769,24 @@ class Tile(tk.Frame):
         self.lbl_state.pack(fill="x", padx=pad, pady=(app.px(4), 0))
         self.lbl_detail.pack(fill="x", padx=pad)
         self.lbl_dest.pack(fill="x", padx=pad, pady=(app.px(10), app.px(12)))
+        self.btn = FlatButton(self, "", None, kind="dark", font=app.bold(9), padx=app.px(10),
+                              pady=app.px(3))
+        self.btn_pack = {"anchor": "w", "padx": pad, "pady": (0, app.px(12))}
         self.show("rest", "En attente")
 
-    def show(self, look, state, detail=""):
+    def show(self, look, state, detail="", action=None):
+        """`action` = (libellé, fonction) : un bouton dans la tuile, pour ce qu'elle réclame."""
         bg, fg, soft, edge = self.LOOKS[look]
         self.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
         self.lbl_title.configure(bg=bg, fg=fg)
         self.lbl_state.configure(bg=bg, fg=fg, text=state)
         self.lbl_detail.configure(bg=bg, fg=soft, text=detail)
         self.lbl_dest.configure(bg=bg, fg=soft)
+        if action:
+            self.btn.configure(text=action[0], command=action[1], highlightbackground=bg)
+            self.btn.pack(**self.btn_pack)
+        else:
+            self.btn.pack_forget()
 
     def set_dest(self, name):
         self.lbl_dest.configure(text=f"→ {name}" if name else "")
@@ -714,7 +802,7 @@ class SettingsDialog(tk.Toplevel):
 
     def __init__(self, master, cfg, on_save):
         super().__init__(master, bg=NIGHT)
-        self.attributes("-alpha", 0.0)
+        self.withdraw()  # cachée le temps de se construire et de se placer
         self.title("Réglages des chemins")
         self.resizable(False, False)
         self.cfg, self.on_save = dict(cfg), on_save
@@ -739,9 +827,25 @@ class SettingsDialog(tk.Toplevel):
             entry.bind("<FocusOut>", lambda _, f=field: f.configure(highlightbackground=RULE))
             FlatButton(row, "…", lambda k=key: self.browse(k), font=master.bold(10),
                        padx=px(10), pady=px(2)).pack(side="left", padx=(px(8), 0))
-        FlatButton(self, "Enregistrer", self.save, kind="primary", font=master.bold(10),
-                   padx=px(20), pady=px(7)).pack(anchor="e", padx=side, pady=px(20))
+        bottom = tk.Frame(self, bg=NIGHT)
+        bottom.pack(fill="x", padx=side, pady=px(20))
+        self.startup_var = None
+        if getattr(sys, "frozen", False):  # un script n'a pas d'exe à inscrire
+            self.startup_var = tk.BooleanVar(value=startup_enabled())
+            Check(bottom, "Lancer au démarrage de Windows", self.startup_var, lambda: None,
+                  master).pack(side="left")
+        FlatButton(bottom, "Enregistrer", self.save, kind="primary", font=master.bold(10),
+                   padx=px(20), pady=px(7)).pack(side="right")
         self.transient(master)
+        self.update_idletasks()
+        # Au milieu de la fenêtre principale (plus grande que celle-ci : elle n'en sort pas).
+        # La position se donne AVANT de toucher à la transparence : réglée après, Windows
+        # l'ignore et ouvre la fenêtre dans le coin de l'écran.
+        x = master.winfo_x() + max(0, (master.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = master.winfo_y() + max(0, (master.winfo_height() - self.winfo_reqheight()) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.attributes("-alpha", 0.0)  # invisible le temps de teinter la barre de titre
+        self.deiconify()
         self.update()
         dark_title_bar(self)
         self.attributes("-alpha", 1.0)
@@ -756,12 +860,18 @@ class SettingsDialog(tk.Toplevel):
         for k, v in self.vars.items():
             self.cfg[k] = v.get().strip()
         save_config(self.cfg)
+        if self.startup_var is not None and self.startup_var.get() != startup_enabled():
+            try:
+                set_startup(self.startup_var.get())
+            except OSError as exc:
+                messagebox.showwarning(APP_NAME, "Le lancement au démarrage de Windows n'a pas "
+                                                 f"pu être réglé :\n{exc}", parent=self)
         self.on_save(self.cfg)
         self.destroy()
 
 
 class App(tk.Tk):
-    def __init__(self, after_update=False):
+    def __init__(self, after_update=False, at_startup=False):
         super().__init__()
         self.attributes("-alpha", 0.0)  # invisible le temps de se dessiner : pas d'éclair blanc
         self.title(f"{APP_NAME} v{VERSION}")
@@ -776,10 +886,13 @@ class App(tk.Tk):
         self.geometry(f"{self.px(760)}x{self.px(660)}")
         self.cfg = load_config()
         self.busy = False
-        self.next_run = time.time() + 5 if self.cfg["auto"] else None
+        # lancé par Windows, on laisse une minute aux disques et au réseau pour arriver
+        self.next_run = time.time() + (60 if at_startup else 5) if self.cfg["auto"] else None
         self.alertes_vues = set()  # évite de répéter la même alerte toutes les 10 min
+        self.followed = None       # le dernier event de Kadra pris en compte (cf. event_to_follow)
         self.pending_update = None
         self.installing = False
+        self.checking = False
         self.update_error_seen = False
         self.told_hidden = False
 
@@ -794,6 +907,10 @@ class App(tk.Tk):
 
         self.build()
         self.refresh_events()
+        # lancé par Windows : pas de fenêtre, seulement l'icône (sauf sur un PC pas encore réglé)
+        discreet = bool(at_startup and self.tray and config_is_set())
+        if discreet:
+            self.withdraw()
         self.update()
         dark_title_bar(self)
         self.attributes("-alpha", 1.0)
@@ -801,6 +918,12 @@ class App(tk.Tk):
 
         self.write_log(f"Mise à jour installée : version {VERSION}." if after_update
                        else f"{APP_NAME} {VERSION} démarré.")
+        if discreet:
+            self.told_hidden = True
+            self.tray.balloon(f"{APP_NAME} est lancé",
+                              f"Copie automatique toutes les {self.cfg['intervalle_min']} min."
+                              if self.cfg["auto"] else
+                              "Copie automatique coupée : ouvre la fenêtre pour la remettre.")
         if not config_is_set():
             self.after(200, self.open_settings)
         self.after(1000, self.tick)
@@ -808,6 +931,8 @@ class App(tk.Tk):
         if getattr(sys, "frozen", False):
             self.after(3000, self.look_for_update)
             self.after(30000, cleanup_old)
+        else:
+            self.version_lbl.configure(text=f"v{VERSION} · script", cursor="arrow")
 
     # -- construction
     def px(self, n):
@@ -886,6 +1011,8 @@ class App(tk.Tk):
         self.run_btn = FlatButton(btns, "Sauvegarder maintenant", self.start_backup,
                                   kind="primary", font=self.bold(11), padx=px(22), pady=px(8))
         self.run_btn.pack(side="left")
+        FlatButton(btns, "Stop", self.stop_copies, font=self.bold(11), padx=px(18),
+                   pady=px(8)).pack(side="left", padx=(px(8), 0))
         self.status = tk.Label(btns, text="", bg=NIGHT, fg=PAPER, font=self.body(10))
         self.status.pack(side="left", padx=px(16))
 
@@ -909,9 +1036,15 @@ class App(tk.Tk):
         foot.pack(side="bottom", fill="x", padx=side, pady=(px(10), px(14)))
         note = ("Fermer la fenêtre ne l'arrête pas : elle reste près de l'horloge."
                 if self.tray else "Fermer la fenêtre la réduit dans la barre des tâches.")
-        tk.Label(foot, text=note, bg=NIGHT, fg=MUTED, font=self.body(9)).pack(side="left")
         FlatButton(foot, "Quitter", self.quit_app, font=self.body(9), padx=px(12),
                    pady=px(3)).pack(side="right")
+        # où en est la mise à jour ; un clic revérifie tout de suite
+        self.version_lbl = tk.Label(foot, text=f"v{VERSION}", bg=NIGHT, fg=MUTED,
+                                    font=self.body(9), cursor="hand2")
+        self.version_lbl.pack(side="right", padx=px(14))
+        self.version_lbl.bind("<Button-1>", self.check_update_now)
+        tk.Label(foot, text=note, bg=NIGHT, fg=MUTED, font=self.body(9), anchor="w",
+                 width=1).pack(side="left", fill="x", expand=True)
 
         box = tk.Frame(self, bg=INK)
         box.pack(fill="both", expand=True, padx=side, pady=(px(16), 0))
@@ -964,9 +1097,19 @@ class App(tk.Tk):
         hint = current_event_hint(self.cfg)
         if hint in events:
             self.event_var.set(hint)
+            self.followed = hint
         elif events and self.event_var.get() not in events:
             self.event_var.set(events[0])
         self.show_destinations()
+
+    def adopt_event(self, event, events):
+        """Kadra est passé sur un autre event : les copies le suivent, et on le dit."""
+        self.event_cb["values"] = events
+        self.event_var.set(event)
+        self.on_event_chosen()
+        self.write_log(f"Kadra est passé sur {event} : les copies le suivent.")
+        if self.tray and self.hidden():
+            self.tray.balloon("Nouvel event", f"Les copies suivent Kadra : {event}.")
 
     def on_event_chosen(self, _event=None):
         self.event_cb.selection_clear()
@@ -1013,6 +1156,8 @@ class App(tk.Tk):
 
     def show_window(self):
         self.deiconify()
+        self.update_idletasks()
+        dark_title_bar(self)  # lancée par Windows, la fenêtre se montre ici pour la première fois
         self.lift()
         self.attributes("-topmost", True)  # passe devant, sans y rester
         self.after(200, lambda: self.attributes("-topmost", False))
@@ -1038,6 +1183,8 @@ class App(tk.Tk):
                     self.show_window()
                 elif ask == "backup":
                     self.start_backup()
+                elif ask == "stop":
+                    self.stop_copies()
                 elif ask == "quit" and self.quit_app():
                     return
         except queue.Empty:
@@ -1081,13 +1228,25 @@ class App(tk.Tk):
             return
         self.persist_options()
         self.busy = True
+        _stop.clear()
         self.run_btn.enable(False)
         self.status.configure(text="Copie en cours…", fg=PAPER)
         self.tell_tray("Copie en cours…")
         threading.Thread(target=self.backup_worker,
-                         args=(event, self.miroir_var.get()), daemon=True).start()
+                         args=(event, self.miroir_var.get(), not manual), daemon=True).start()
 
-    def backup_worker(self, event, miroir):
+    def backup_worker(self, event, miroir, follow=False):
+        if follow:  # en automatique : si Kadra a changé d'event, c'est le sien qu'on copie
+            try:
+                events = list_events(self.cfg)
+                new = event_to_follow(current_event_hint(self.cfg), self.followed, events)
+            except OSError:
+                new = None
+            if new:
+                self.followed = new
+                if new != event:
+                    event = new
+                    self.after(0, self.adopt_event, new, events)
         dest_root = Path(self.cfg["dest"])
         errors = 0
         if not dest_root.is_dir():
@@ -1098,6 +1257,8 @@ class App(tk.Tk):
         else:
             for label, src, dst in build_jobs(self.cfg, event):
                 tile = self.tiles[label]
+                if _stop.is_set():
+                    break
                 if not src.is_dir():
                     self.after(0, self.write_log, f"{label:5}  source absente, ignorée ({src})")
                     self.after(0, tile.show, "rest", "Source absente", "dossier introuvable sur ce PC")
@@ -1116,7 +1277,7 @@ class App(tk.Tk):
                         cle = (event, label)
                         if cle not in self.alertes_vues:
                             self.alertes_vues.add(cle)
-                            self.after(0, self.warn_blocked, msg, dst)
+                            self.after(0, self.warn_blocked, msg, label)
                 try:
                     code, copied, _ = run_robocopy(src, dst, miroir_job)
                 except FileNotFoundError:
@@ -1125,13 +1286,18 @@ class App(tk.Tk):
                     errors += 1
                     break
                 when = datetime.now().strftime("%H:%M")
+                if _stop.is_set():
+                    self.after(0, self.write_log, f"{label:5}  copie arrêtée en cours de route (Stop)")
+                    self.after(0, tile.show, "alert", "Arrêtée", f"copie interrompue · {when}")
+                    break
                 if code <= ROBOCOPY_OK_MAX:
                     self.after(0, self.write_log, f"{label:5}  OK, {copied} fichier(s) copié(s) → {dst.name}")
                     news = ("rien de nouveau" if not copied else
                             "1 fichier copié" if copied == 1 else f"{copied} fichiers copiés")
                     if miroir and not miroir_job:
                         self.after(0, tile.show, "alert", "Suppression bloquée",
-                                   f"{news}, rien d'effacé · {when}")
+                                   f"{news}, rien d'effacé · {when}",
+                                   ("Forcer la suppression…", lambda l=label: self.ask_force(l)))
                     else:
                         self.after(0, tile.show, "rest", "À jour", f"{news} · {when}")
                 else:
@@ -1141,16 +1307,112 @@ class App(tk.Tk):
                                f"robocopy, code {code} · {when}")
         self.after(0, self.backup_done, errors)
 
-    def warn_blocked(self, msg, dst):
+    def warn_blocked(self, msg, label):
         if self.hidden():
             self.show_window()  # une alerte ne reste pas cachée près de l'horloge
         messagebox.showwarning(
             APP_NAME, f"{msg}\n\nVérifie la source avant toute chose.\n"
-                      f"Si la suppression est voulue, fais le ménage à la main dans :\n{dst}")
+                      f"Si la suppression est voulue : « Forcer la suppression… », "
+                      f"sur la tuile {label}.")
+
+    # -- la suppression que le garde-fou a bloquée, validée à la main
+    def ask_force(self, label):
+        """Bouton d'une tuile bloquée. On recompte d'abord : la question porte sur ce qui
+        serait supprimé maintenant, pas sur ce qu'on avait vu dix minutes plus tôt."""
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Une copie est en cours. Réessaie quand elle est finie.")
+            return
+        event = self.event_var.get()
+        job = next((j for j in build_jobs(self.cfg, event) if j[0] == label), None)
+        if not event or not job:
+            return
+        self.busy = True  # rien ne démarre pendant le comptage ni pendant la question
+        _stop.clear()
+        self.run_btn.enable(False)
+        self.status.configure(text="Comptage…", fg=PAPER)
+        threading.Thread(target=self.count_for_force, args=(event, *job), daemon=True).start()
+
+    def count_for_force(self, event, label, src, dst):
+        try:
+            found = src.is_dir()
+            nb_sup, nb_tot = check_suppression(src, dst)[1:] if found else (0, 0)
+        except OSError:
+            found, nb_sup, nb_tot = False, 0, 0
+        self.after(0, self.confirm_force, event, label, src, dst, found, nb_sup, nb_tot)
+
+    def confirm_force(self, event, label, src, dst, found, nb_sup, nb_tot):
+        what, all_of_them = (("fichiers sauvegardés", "TOUS") if label == "DATA"
+                             else ("photos sauvegardées", "TOUTES"))
+        if not found:
+            messagebox.showwarning(APP_NAME, f"{label} : la source est introuvable.\n{src}\n\n"
+                                             "Rien n'est supprimé.")
+        elif not nb_sup:
+            messagebox.showinfo(APP_NAME, f"{label} : plus rien à supprimer, le disque "
+                                          "correspond à la source.")
+        elif messagebox.askyesno(
+                APP_NAME,
+                f"{label} : {nb_sup} des {nb_tot} {what} ne sont plus dans la source"
+                f"{' : ' + all_of_them if nb_sup == nb_tot else ''}.\n\n"
+                f"Source : {src}\nDisque : {dst}\n\n"
+                "Supprimer du disque tout ce qui n'est plus dans la source ?\n"
+                "C'est définitif : rien ne passe par la corbeille.",
+                icon="warning", default="no"):
+            self.write_log(f"⚠ {label} : suppression forcée à la main "
+                           f"({nb_sup} des {nb_tot} {what}).")
+            self.alertes_vues.discard((event, label))  # un nouveau blocage redonnera l'alerte
+            self.status.configure(text="Suppression en cours…")
+            threading.Thread(target=self.force_worker, args=(label, src, dst),
+                             daemon=True).start()
+            return
+        self.busy = False  # on a renoncé : tout reste comme c'était
+        self.run_btn.enable(True)
+        self.status.configure(text="")
+
+    def force_worker(self, label, src, dst):
+        """Le miroir de ce seul dossier, garde-fou levé : c'est ce qu'on vient de valider."""
+        tile, errors = self.tiles[label], 0
+        self.after(0, tile.show, "busy", "Suppression en cours…")
+        try:
+            code = run_robocopy(src, dst, True)[0]
+        except FileNotFoundError:
+            code = None
+        when = datetime.now().strftime("%H:%M")
+        if _stop.is_set():
+            self.after(0, self.write_log, f"{label:5}  suppression arrêtée en cours de route (Stop)")
+            self.after(0, tile.show, "alert", "Arrêtée", f"suppression interrompue · {when}")
+        elif code is not None and code <= ROBOCOPY_OK_MAX:
+            self.after(0, self.write_log, f"{label:5}  OK, le disque correspond à la source → {dst.name}")
+            self.after(0, tile.show, "rest", "À jour", f"suppression forcée · {when}")
+        else:
+            errors = 1
+            self.after(0, self.write_log, f"⚠ {label:5}  ERREUR robocopy (code {code}) → {dst}")
+            self.after(0, tile.show, "alert", "Erreur de copie", f"robocopy, code {code} · {when}")
+        self.after(0, self.backup_done, errors)
+
+    def stop_copies(self):
+        """Stop : la copie en cours s'arrête net, et plus rien ne part tout seul tant qu'on
+        n'a pas recoché « Automatique ». « Sauvegarder maintenant » reste possible."""
+        was_busy = self.busy
+        stop_robocopy()
+        self.auto_var.set(False)
+        self.persist_options()
+        self.next_run = None
+        self.write_log("⚠ Stop : " + ("copie en cours arrêtée, " if was_busy else "")
+                       + "copie automatique coupée.")
+        if not was_busy:
+            self.show_stopped()
+
+    def show_stopped(self):
+        self.status.configure(text="Copies arrêtées. Coche « Automatique » pour reprendre.",
+                              fg=AMBER)
+        self.tell_tray("Copies arrêtées")
 
     def backup_done(self, errors):
         self.busy = False
         self.run_btn.enable(True)
+        if _stop.is_set():  # arrêtée par Stop : ni « OK », ni erreur, ni prochain tour
+            self.show_stopped()
+            return
         now = datetime.now().strftime("%H:%M")
         self.status.configure(fg=AMBER if errors else PAPER)
         if errors:
@@ -1167,22 +1429,37 @@ class App(tk.Tk):
 
     # -- mise à jour
     def look_for_update(self):
-        threading.Thread(target=self.update_worker, daemon=True).start()
+        self.check_update_now()
         self.after(UPDATE_EVERY_H * 3600 * 1000, self.look_for_update)
+
+    def check_update_now(self, _event=None):
+        """Au lancement, toutes les 6 heures, et au clic sur la version en bas de fenêtre."""
+        if self.checking or self.installing or not getattr(sys, "frozen", False):
+            return
+        self.checking = True
+        self.version_lbl.configure(text=f"v{VERSION} · vérification…")
+        threading.Thread(target=self.update_worker, daemon=True).start()
 
     def update_worker(self):
         try:
-            found = check_update()
+            found, error = check_update(), None
         except Exception as exc:
-            self.after(0, self.update_unreachable, exc)
-            return
-        if found:
-            self.after(0, self.offer_update, found)
+            found, error = None, exc
+        self.after(0, self.update_checked, found, error)
 
-    def update_unreachable(self, exc):
-        if not self.update_error_seen:  # sans Internet sur un concours : une ligne, pas une par tour
-            self.update_error_seen = True
-            self.write_log(f"Recherche de mise à jour impossible pour l'instant ({exc}).")
+    def update_checked(self, found, error):
+        """Ce que la dernière vérification a donné, écrit en bas de fenêtre."""
+        self.checking = False
+        if error is not None:
+            self.version_lbl.configure(text=f"v{VERSION} · mise à jour non vérifiée")
+            if not self.update_error_seen:  # sans Internet sur un concours : une ligne, pas une par tour
+                self.update_error_seen = True
+                self.write_log(f"Recherche de mise à jour impossible pour l'instant ({error}).")
+        elif found:
+            self.version_lbl.configure(text=f"v{VERSION} · {found['version']} disponible")
+            self.offer_update(found)
+        else:
+            self.version_lbl.configure(text=f"v{VERSION} · à jour")
 
     def offer_update(self, found):
         if self.installing or (self.pending_update or {}).get("version") == found["version"]:
@@ -1241,6 +1518,7 @@ class App(tk.Tk):
 
 def main():
     after_update = ARG_AFTER_UPDATE in sys.argv[1:]
+    at_startup = ARG_AT_STARTUP in sys.argv[1:]
     if sys.platform == "win32":
         enable_dpi_awareness()
         # après une mise à jour, l'ancienne version finit de se fermer : on lui laisse le temps
@@ -1251,9 +1529,10 @@ def main():
                     win32().user32.MessageBoxW(None, f"{APP_NAME} est déjà ouvert.", APP_NAME, 0x40)
                 return
             time.sleep(0.25)
+        refresh_startup()
     cleanup_old()
     adopt_old_config()
-    App(after_update).mainloop()
+    App(after_update, at_startup).mainloop()
 
 
 if __name__ == "__main__":
