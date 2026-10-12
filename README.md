@@ -16,10 +16,14 @@ est faite par `robocopy`, livré avec Windows.
 
 ## Installer
 
-Télécharger **`Sauvegarde Event.exe`** depuis la page
+Télécharger **`Sauvegarde.Event.exe`** depuis la page
 [Releases](https://github.com/hlelouarn/sauvegarde-event/releases/latest)
 (le dépôt est privé : il faut être connecté à GitHub) et le poser où l'on veut,
-sur le Bureau par exemple. Rien d'autre à installer.
+sur le Bureau par exemple. Rien d'autre à installer. GitHub remplace l'espace
+du nom par un point ; on peut renommer le fichier sans conséquence.
+
+Pas de mise à jour automatique : pour changer de version, télécharger le nouvel
+exe et remplacer l'ancien. Les réglages sont conservés.
 
 Au premier lancement, Windows affiche « Windows a protégé votre ordinateur »
 (SmartScreen), parce que l'exe n'est pas signé : cliquer sur
