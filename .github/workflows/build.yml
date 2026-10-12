@@ -24,30 +24,33 @@ jobs:
         run: |
           import os, re, sys
           from pathlib import Path
-          source = Path("sauvegarde_event.pyw").read_text(encoding="utf-8")
+          source = Path("prisma_safe.pyw").read_text(encoding="utf-8")
           trouve = re.search(r'^VERSION\s*=\s*"([^"]+)"', source, re.M)
           if not trouve:
-              sys.exit("Constante VERSION introuvable dans sauvegarde_event.pyw")
+              sys.exit("Constante VERSION introuvable dans prisma_safe.pyw")
           version, tag = trouve.group(1), os.environ["GITHUB_REF_NAME"]
           if tag != f"v{version}":
               sys.exit(f"Tag {tag} mais VERSION = {version} : le tag attendu est v{version}")
           print(f"Tag {tag} et VERSION {version} concordent")
 
+      - name: Tests
+        run: python -m unittest discover -s tests -v
+
       - name: Installer PyInstaller
         run: python -m pip install -r requirements-build.txt
 
       - name: Compiler l'exe
-        run: pyinstaller --onefile --noconsole --icon=logo.ico --name "Sauvegarde Event" sauvegarde_event.pyw
+        run: pyinstaller --onefile --noconsole --icon=logo.ico --name "Prisma Safe" prisma_safe.pyw
 
       - uses: actions/upload-artifact@v7
         with:
-          name: Sauvegarde-Event
-          path: dist/Sauvegarde Event.exe
+          name: Prisma-Safe
+          path: dist/Prisma Safe.exe
           if-no-files-found: error
 
       - name: Attacher l'exe à la Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/Sauvegarde Event.exe
+          files: dist/Prisma Safe.exe
           fail_on_unmatched_files: true
